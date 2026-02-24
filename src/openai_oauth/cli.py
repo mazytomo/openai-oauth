@@ -91,7 +91,11 @@ def main():
     )
     login_group.add_argument(
         "--server", action="store_true",
-        help="Server mode: start callback server (for Docker/remote). Port configurable via OPENAI_OAUTH_PORT",
+        help=(
+            "Server mode: start callback server on 127.0.0.1 "
+            "(set OPENAI_OAUTH_ALLOW_INSECURE_BIND=1 for non-loopback). "
+            "Port configurable via OPENAI_OAUTH_PORT"
+        ),
     )
     login_parser.set_defaults(func=cmd_login)
 

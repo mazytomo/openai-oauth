@@ -25,6 +25,8 @@ from .tokens import (
 logger = logging.getLogger(__name__)
 
 AUTH_ENDPOINT = "https://auth.openai.com/oauth/authorize"
+SAFE_BIND_ADDRESSES = {"127.0.0.1", "localhost", "::1"}
+ALLOW_INSECURE_BIND_ENV = "OPENAI_OAUTH_ALLOW_INSECURE_BIND"
 
 
 def _parse_port() -> int:
@@ -226,8 +228,8 @@ def login_with_server(
         timeout: Server timeout in seconds (default 300s / 5 min).
         bind_address: Address to bind the callback server to.
             Use "127.0.0.1" (default) for local-only access.
-            Use "0.0.0.0" for Docker or remote environments where the
-            callback needs to be accessible from outside the container.
+            Non-loopback bind addresses are blocked by default for safety.
+            To allow them, explicitly set OPENAI_OAUTH_ALLOW_INSECURE_BIND=1.
 
     Returns:
         The auth URL to open in a browser.
@@ -236,6 +238,18 @@ def login_with_server(
         RuntimeError: If the callback port is already in use.
     """
     verifier, state, auth_url = _prepare_auth_session()
+    bind_address_normalized = bind_address.strip().lower()
+    allow_insecure_bind = os.environ.get(ALLOW_INSECURE_BIND_ENV, "0") == "1"
+    if bind_address_normalized not in SAFE_BIND_ADDRESSES and not allow_insecure_bind:
+        raise ValueError(
+            "Refusing non-loopback bind address for callback server. "
+            f"Set {ALLOW_INSECURE_BIND_ENV}=1 to override (unsafe)."
+        )
+    if bind_address_normalized not in SAFE_BIND_ADDRESSES:
+        logger.warning(
+            "Using non-loopback bind address (%s). Callback traffic may be exposed.",
+            bind_address,
+        )
 
     done = Event()
 

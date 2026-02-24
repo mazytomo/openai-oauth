@@ -21,8 +21,12 @@ TOKEN_ENDPOINT = f"{ISSUER}/oauth/token"
 SCOPES = "openid profile email offline_access"
 JWKS_URI = f"{ISSUER}/.well-known/jwks.json"
 
-DATA_DIR = Path.home() / ".openai-oauth"
-TOKEN_FILE = DATA_DIR / "tokens.json"
+DEFAULT_DATA_DIR = Path.home() / ".openai-oauth"
+DATA_DIR = Path(os.environ.get("OPENAI_OAUTH_DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
+TOKEN_FILE = Path(
+    os.environ.get("OPENAI_OAUTH_TOKEN_FILE", str(DATA_DIR / "tokens.json"))
+).expanduser()
+ALLOW_UNVERIFIED_JWT_ENV = "OPENAI_OAUTH_ALLOW_UNVERIFIED_JWT"
 
 _refresh_lock = threading.Lock()
 
@@ -48,9 +52,14 @@ def _get_jwks_client():
 
 def _save_tokens(data: dict) -> None:
     """Atomically save tokens to disk (write-then-rename)."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.chmod(0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, prefix=".tokens_")
+    token_dir = TOKEN_FILE.parent
+    token_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        token_dir.chmod(0o700)
+    except OSError:
+        # Best effort only; some filesystems (or ACL setups) ignore chmod.
+        pass
+    fd, tmp_path = tempfile.mkstemp(dir=token_dir, prefix=".tokens_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -73,45 +82,8 @@ def _load_tokens() -> dict | None:
         return None
 
 
-def _decode_jwt_payload(token: str) -> dict:
-    """Decode and optionally verify the JWT payload.
-
-    If PyJWT with cryptography is installed (pip install openai-oauth[crypto]),
-    the JWT signature is verified against OpenAI's JWKS endpoint.
-
-    - Signature verification failure raises (token may be tampered).
-    - Network/JWKS fetch errors fall back to unverified decode with a warning.
-    - If PyJWT is not installed, falls back to unverified decode (acceptable
-      because the token is received directly from OpenAI's HTTPS endpoint).
-    """
-    try:
-        import jwt
-
-        jwks_client = _get_jwks_client()
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        return jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256"],
-            audience=CLIENT_ID,
-            options={"verify_exp": False},  # We check expiry ourselves
-        )
-    except ImportError:
-        pass  # PyJWT not installed — fall back to unverified decode
-    except Exception as e:
-        # Distinguish signature failures from transient network errors
-        try:
-            import jwt as _jwt
-            if isinstance(e, _jwt.exceptions.InvalidTokenError):
-                # Genuine verification failure — do NOT fall back
-                logger.warning("JWT signature verification FAILED: %s", type(e).__name__)
-                raise
-        except ImportError:
-            pass
-        # Network/JWKS fetch error — fall back with warning
-        logger.warning("JWKS fetch failed (%s), using unverified JWT decode", type(e).__name__)
-
-    # Fallback: unverified decode (token came from OpenAI's HTTPS endpoint)
+def _decode_jwt_payload_unverified(token: str) -> dict:
+    """Unsafe JWT payload decode without signature verification."""
     parts = token.split(".")
     if len(parts) != 3:
         return {}
@@ -123,6 +95,54 @@ def _decode_jwt_payload(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
         return {}
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode and verify JWT payload with secure-by-default behavior.
+
+    By default, signature validation against OpenAI JWKS is mandatory.
+    Set OPENAI_OAUTH_ALLOW_UNVERIFIED_JWT=1 only for debugging as an unsafe
+    override when verification cannot be performed.
+    """
+    allow_unverified = os.environ.get(ALLOW_UNVERIFIED_JWT_ENV, "0") == "1"
+
+    try:
+        import jwt
+    except ImportError as e:
+        if not allow_unverified:
+            raise RuntimeError(
+                "PyJWT with cryptography is required for token verification. "
+                "Install dependencies from pyproject.toml or set "
+                f"{ALLOW_UNVERIFIED_JWT_ENV}=1 (unsafe fallback)."
+            ) from e
+        logger.warning(
+            "PyJWT unavailable; using unverified JWT decode because %s=1",
+            ALLOW_UNVERIFIED_JWT_ENV,
+        )
+        return _decode_jwt_payload_unverified(token)
+
+    try:
+        jwks_client = _get_jwks_client()
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=CLIENT_ID,
+            options={"verify_exp": False},  # We check expiry ourselves
+        )
+    except Exception as e:
+        if not allow_unverified:
+            raise RuntimeError(
+                "JWT verification failed. "
+                f"Set {ALLOW_UNVERIFIED_JWT_ENV}=1 for unsafe fallback decode."
+            ) from e
+        logger.warning(
+            "JWT verification failed (%s); using unverified decode because %s=1",
+            type(e).__name__,
+            ALLOW_UNVERIFIED_JWT_ENV,
+        )
+        return _decode_jwt_payload_unverified(token)
 
 
 # --- Token exchange: id_token -> OpenAI API key ---

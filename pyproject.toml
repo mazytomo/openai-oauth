@@ -17,12 +17,13 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "httpx>=0.27.0",
+    "httpx>=0.27.0,<0.29.0",
+    "pyjwt[crypto]>=2.8.0,<3.0.0",
 ]
 
 [project.optional-dependencies]
 crypto = [
-    "pyjwt[crypto]>=2.8.0",
+    "pyjwt[crypto]>=2.8.0,<3.0.0",
 ]
 
 [project.scripts]
